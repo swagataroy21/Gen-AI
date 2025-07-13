@@ -1,0 +1,238 @@
+/*
+Folder Structure:
+
+project-root/
+├── backend/
+│   ├── app.py
+│   ├── dash_app.py
+│   └── utils.py
+├── frontend/
+│   ├── public/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── FileUpload.js
+│   │   │   └── Dashboard.js
+│   │   ├── App.js
+│   │   ├── index.js
+│   └── package.json
+├── uploads/  # Temp storage for uploaded files
+├── .gitignore
+└── requirements.txt
+*/
+
+// backend/app.py
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import pandas as pd
+import os
+import datetime
+from dash_app import create_dash_app
+from utils import process_ageing
+
+app = Flask(__name__)
+CORS(app)
+
+DATA = {'df': None}
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    file = request.files['file']
+    if file:
+        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+        file.save(filepath)
+        df = pd.read_excel(filepath)
+        DATA['df'] = df
+        return jsonify({'message': 'File uploaded successfully', 'columns': df.columns.tolist()})
+    return jsonify({'error': 'No file uploaded'}), 400
+
+@app.route('/ageing', methods=['GET'])
+def ageing():
+    gl = request.args.get('gl')
+    ref_date = request.args.get('ref_date')
+    df = DATA['df']
+    if df is None:
+        return jsonify({'error': 'No data available'}), 400
+    try:
+        ref_date = pd.to_datetime(ref_date)
+        result = process_ageing(df, gl, ref_date)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+create_dash_app(app, DATA)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
+
+// backend/utils.py
+import pandas as pd
+
+def process_ageing(df, gl_account, ref_date):
+    df['Posting Date'] = pd.to_datetime(df['Posting Date'])
+    df = df[df['G/L Account Number'] == gl_account]
+    df['days_diff'] = (ref_date - df['Posting Date']).dt.days
+
+    bins = [0, 90, 180, 365, 730, 1095, float('inf')]
+    labels = ['<90 days', '90-180 days', '180 days-1 year', '1-2 years', '2-3 years', '>3 years']
+    df['age_bucket'] = pd.cut(df['days_diff'], bins=bins, labels=labels, right=False)
+
+    result = df.groupby('age_bucket')['Amount in Local Currency'].sum().reset_index()
+    result.columns = ['Age Bucket', 'Total Amount']
+    return result.to_dict(orient='records')
+
+
+// backend/dash_app.py
+from dash import Dash, dcc, html, Input, Output
+import dash_table
+import plotly.express as px
+import pandas as pd
+import flask
+
+def create_dash_app(flask_app, DATA):
+    dash_app = Dash(__name__, server=flask_app, url_base_pathname='/dash/')
+
+    dash_app.layout = html.Div([
+        html.H2('GL Ageing Dashboard'),
+        dcc.Dropdown(id='gl-dropdown'),
+        dcc.DatePickerSingle(id='ref-date', date=str(pd.Timestamp.today().date())),
+        html.Button('Analyze', id='analyze-btn'),
+        dash_table.DataTable(id='result-table'),
+        dcc.Graph(id='bar-chart')
+    ])
+
+    @dash_app.callback(
+        [Output('gl-dropdown', 'options'), Output('gl-dropdown', 'value')],
+        Input('gl-dropdown', 'id')
+    )
+    def update_dropdown(_):
+        df = DATA['df']
+        if df is not None:
+            options = [{'label': gl, 'value': gl} for gl in sorted(df['G/L Account Number'].dropna().unique())]
+            return options, options[0]['value'] if options else None
+        return [], None
+
+    @dash_app.callback(
+        [Output('result-table', 'data'), Output('result-table', 'columns'), Output('bar-chart', 'figure')],
+        Input('analyze-btn', 'n_clicks'),
+        [Input('gl-dropdown', 'value'), Input('ref-date', 'date')]
+    )
+    def update_table(_, gl, ref_date):
+        if not gl or not ref_date:
+            return [], [], {}
+        df = DATA['df']
+        result = df.copy()
+        result = result[result['G/L Account Number'] == gl]
+        result['Posting Date'] = pd.to_datetime(result['Posting Date'])
+        result['days_diff'] = (pd.to_datetime(ref_date) - result['Posting Date']).dt.days
+        bins = [0, 90, 180, 365, 730, 1095, float('inf')]
+        labels = ['<90 days', '90-180 days', '180 days-1 year', '1-2 years', '2-3 years', '>3 years']
+        result['age_bucket'] = pd.cut(result['days_diff'], bins=bins, labels=labels, right=False)
+        table = result.groupby('age_bucket')['Amount in Local Currency'].sum().reset_index()
+        table.columns = ['Age Bucket', 'Total Amount']
+        columns = [{'name': i, 'id': i} for i in table.columns]
+        fig = px.bar(table, x='Age Bucket', y='Total Amount', title='Ageing Summary')
+        return table.to_dict('records'), columns, fig
+
+
+// frontend/src/components/FileUpload.js
+import React, { useState } from 'react';
+import axios from 'axios';
+import { useNavigate } from 'react-router-dom';
+
+export default function FileUpload() {
+  const [file, setFile] = useState(null);
+  const navigate = useNavigate();
+
+  const handleFileChange = (e) => setFile(e.target.files[0]);
+
+  const handleUpload = async () => {
+    const formData = new FormData();
+    formData.append('file', file);
+    await axios.post('http://localhost:5000/upload', formData);
+    navigate('/dashboard');
+  };
+
+  return (
+    <div style={{ padding: '2rem', backgroundColor: '#f0f8ff' }}>
+      <h2 style={{ color: '#003366' }}>Upload Excel File</h2>
+      <input type="file" onChange={handleFileChange} />
+      <button onClick={handleUpload}>Go</button>
+    </div>
+  );
+}
+
+
+// frontend/src/components/Dashboard.js
+import React from 'react';
+
+export default function Dashboard() {
+  return (
+    <iframe
+      title="Dash"
+      src="http://localhost:5000/dash/"
+      style={{ width: '100%', height: '90vh', border: 'none' }}
+    />
+  );
+}
+
+
+// frontend/src/App.js
+import React from 'react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
+import FileUpload from './components/FileUpload';
+import Dashboard from './components/Dashboard';
+
+function App() {
+  return (
+    <Router>
+      <Routes>
+        <Route path="/" element={<FileUpload />} />
+        <Route path="/dashboard" element={<Dashboard />} />
+      </Routes>
+    </Router>
+  );
+}
+
+export default App;
+
+
+// frontend/src/index.js
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+
+// frontend/package.json
+{
+  "name": "frontend",
+  "version": "1.0.0",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.12.1",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start"
+  }
+}
+
+
+// requirements.txt
+Flask
+flask-cors
+pandas
+openpyxl
+dash
+plotly
