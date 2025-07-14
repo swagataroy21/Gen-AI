@@ -1,0 +1,29 @@
+pip install google-cloud-bigquery pandas
+from google.cloud import bigquery
+from google.oauth2 import service_account
+import pandas as pd
+
+# Path to your downloaded service account JSON file
+SERVICE_ACCOUNT_FILE = "your-service-account.json"
+
+# Your project ID (get it from GCP Console)
+PROJECT_ID = "your-gcp-project-id"
+
+# Credentials object
+credentials = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
+
+# BigQuery client
+client = bigquery.Client(credentials=credentials, project=PROJECT_ID)
+
+# Sample query - replace with your actual project.dataset.table
+query = """
+    SELECT *
+    FROM `your-gcp-project-id.your_dataset.your_table`
+    LIMIT 1000
+"""
+
+# Run query
+df = client.query(query).to_dataframe()
+
+print("Fetched data:")
+print(df.head())
